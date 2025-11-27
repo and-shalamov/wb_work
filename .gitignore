@@ -1,0 +1,9 @@
+out.yaml
+charts/*
+Chart.lock
+**/Chart.lock
+**/charts/*
+**/out.yaml
+**/*.tgz
+.idea
+.DS_Store
