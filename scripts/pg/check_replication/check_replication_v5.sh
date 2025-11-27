@@ -12,6 +12,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 PURPLE='\033[0;35m'
+ORANGE='\033[0;33m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
@@ -173,6 +174,63 @@ get_password_from_secret() {
     return 1
 }
 
+# Функция для вывода логов с цветовым кодированием
+show_pod_logs() {
+    echo -e "\n${PURPLE}${BOLD}12. Логи пода (последние 5 сообщений каждого уровня):${NC}"
+    
+    # Получаем все логи и фильтруем по уровням
+    local all_logs=$(kubectl logs -n $NAMESPACE $POD_NAME --tail=100 2>/dev/null || echo -e "${RED}Не удалось получить логи пода${NC}")
+    
+    # ERROR логи (красный)
+    echo -e "\n${RED}${BOLD}ERROR логи:${NC}"
+    echo "$all_logs" | grep -i "error" | tail -5 | while read line; do
+        echo -e "${RED}$line${NC}"
+    done
+    if [ $(echo "$all_logs" | grep -i "error" | tail -5 | wc -l) -eq 0 ]; then
+        echo -e "${GREEN}Нет ERROR сообщений${NC}"
+    fi
+    
+    # WARN логи (оранжевый)
+    echo -e "\n${ORANGE}${BOLD}WARN логи:${NC}"
+    echo "$all_logs" | grep -i "warn" | tail -5 | while read line; do
+        echo -e "${ORANGE}$line${NC}"
+    done
+    if [ $(echo "$all_logs" | grep -i "warn" | tail -5 | wc -l) -eq 0 ]; then
+        echo -e "${GREEN}Нет WARN сообщений${NC}"
+    fi
+    
+    # INFO логи (синий)
+    echo -e "\n${BLUE}${BOLD}INFO логи:${NC}"
+    echo "$all_logs" | grep -i "info" | tail -5 | while read line; do
+        echo -e "${BLUE}$line${NC}"
+    done
+    if [ $(echo "$all_logs" | grep -i "info" | tail -5 | wc -l) -eq 0 ]; then
+        echo -e "${GREEN}Нет INFO сообщений${NC}"
+    fi
+    
+    # DEBUG логи (голубой)
+    echo -e "\n${CYAN}${BOLD}DEBUG логи:${NC}"
+    echo "$all_logs" | grep -i "debug" | tail -5 | while read line; do
+        echo -e "${CYAN}$line${NC}"
+    done
+    if [ $(echo "$all_logs" | grep -i "debug" | tail -5 | wc -l) -eq 0 ]; then
+        echo -e "${GREEN}Нет DEBUG сообщений${NC}"
+    fi
+    
+    # FATAL логи (фиолетовый + красный фон)
+    echo -e "\n${PURPLE}${BOLD}FATAL логи:${NC}"
+    echo "$all_logs" | grep -i "fatal" | tail -5 | while read line; do
+        echo -e "${PURPLE}${BOLD}$line${NC}"
+    done
+    if [ $(echo "$all_logs" | grep -i "fatal" | tail -5 | wc -l) -eq 0 ]; then
+        echo -e "${GREEN}Нет FATAL сообщений${NC}"
+    fi
+    
+    # Общий обзор логов
+    echo -e "\n${YELLOW}${BOLD}Общий обзор логов (последние 10 строк):${NC}"
+    kubectl logs -n $NAMESPACE $POD_NAME --tail=10 2>/dev/null || echo -e "${RED}Не удалось получить логи пода${NC}"
+}
+
 # Если пароль не передан как аргумент, получаем его из секрета
 if [ -z "$PG_PASSWORD" ]; then
     echo -e "${CYAN}Пароль не указан, получение из секрета...${NC}"
@@ -316,6 +374,9 @@ WHERE state IS NOT NULL
 GROUP BY datname, usename, state 
 ORDER BY count DESC;" "11. Активные подключения"
 
+# 12. Вывод логов пода
+show_pod_logs
+
 echo -e "\n${BLUE}${BOLD}==============================================${NC}"
 echo -e "${GREEN}${BOLD}Проверка завершена${NC}"
 echo -e "${BLUE}${BOLD}==============================================${NC}"
@@ -330,3 +391,9 @@ echo -e "   ${CYAN}kubectl exec -it -n $NAMESPACE $POD_NAME -- bash -c \"PGPASSW
 echo ""
 echo -e "${YELLOW}3. Мониторинг репликации в реальном времени:${NC}"
 echo -e "   ${CYAN}watch -n1 'kubectl exec -it -n $NAMESPACE $POD_NAME -- patronictl list'${NC}"
+echo ""
+echo -e "${YELLOW}4. Просмотр всех логов пода:${NC}"
+echo -e "   ${CYAN}kubectl logs -n $NAMESPACE $POD_NAME --tail=50${NC}"
+echo ""
+echo -e "${YELLOW}5. Просмотр логов в реальном времени:${NC}"
+echo -e "   ${CYAN}kubectl logs -n $NAMESPACE $POD_NAME -f${NC}"
