@@ -65,10 +65,19 @@ select_secret() {
 }
 
 # Функция для получения пароля из секрета
+# Функция для получения пароля из секрета
 get_password_from_secret() {
     local base_pod_name=$(get_base_pod_name "$POD_NAME")
     
-    echo -e "${CYAN}Поиск секретов для пода: $POD_NAME (базовое имя: $base_pod_name)${NC}" >&2
+    # Извлекаем имя ветки из имени пода (часть между дефисами, соответствующая ветке)
+    local branch_name=$(echo "$POD_NAME" | grep -oE '-(main|stage[0-9]+|prod|dev|test)-' | sed 's/-//g')
+    
+    # Если не удалось извлечь по шаблону, берем предпоследнюю часть
+    if [ -z "$branch_name" ]; then
+        branch_name=$(echo "$POD_NAME" | awk -F'-' '{print $(NF-1)}')
+    fi
+    
+    echo -e "${CYAN}Поиск секретов для пода: $POD_NAME (базовое имя: $base_pod_name, ветка: $branch_name)${NC}" >&2
     echo -e "${CYAN}Пространство имен: $NAMESPACE${NC}" >&2
     
     # Получаем все секреты в неймспейсе
@@ -81,59 +90,39 @@ get_password_from_secret() {
     
     echo -e "${CYAN}Всего секретов в неймспейсе: ${#all_secrets[@]}${NC}" >&2
     
-    # Фильтруем секреты по критериям:
-    # 1. Содержит часть имени пода (без числового суффикса)
-    # 2. ИЛИ содержит ключевые слова: acid, psql, postgresql, postgres
+    # Фильтруем секреты: должны содержать имя ветки И одно из ключевых слов
     local filtered_secrets=()
     for secret in "${all_secrets[@]}"; do
-        # Проверяем, содержит ли секрет базовое имя пода
-        if [[ "$secret" == *"$base_pod_name"* ]]; then
-            filtered_secrets+=("$secret")
-            continue
-        fi
-        
-        # Проверяем ключевые слова
-        if [[ "$secret" == *"acid"* ]] || \
-           [[ "$secret" == *"psql"* ]] || \
-           [[ "$secret" == *"postgresql"* ]] || \
-           [[ "$secret" == *"postgres"* ]]; then
+        if [[ "$secret" == *"$branch_name"* ]] && 
+           ([[ "$secret" == *"acid"* ]] || [[ "$secret" == *"postgres"* ]] || [[ "$secret" == *"psql"* ]]); then
             filtered_secrets+=("$secret")
         fi
     done
     
     if [ ${#filtered_secrets[@]} -eq 0 ]; then
-        echo -e "${RED}Ошибка: не найдено подходящих секретов${NC}" >&2
+        echo -e "${RED}Ошибка: не найдено секретов для ветки '$branch_name' с ключевыми словами (acid|postgres|psql)${NC}" >&2
         echo -e "${YELLOW}Критерии поиска:${NC}" >&2
-        echo -e "${YELLOW}  - Содержит имя пода: $base_pod_name${NC}" >&2
-        echo -e "${YELLOW}  - ИЛИ содержит ключевые слова: acid, psql, postgresql, postgres${NC}" >&2
+        echo -e "${YELLOW}  - Содержит ветку: $branch_name${NC}" >&2
+        echo -e "${YELLOW}  - И содержит одно из: acid, postgres, psql${NC}" >&2
         echo -e "${YELLOW}Доступные секреты в неймспейсе $NAMESPACE:${NC}" >&2
         printf '  %s\n' "${all_secrets[@]}" >&2
         return 1
     fi
     
-    echo -e "${GREEN}Найдено ${#filtered_secrets[@]} подходящих секретов:${NC}" >&2
+    echo -e "${GREEN}Найдено ${#filtered_secrets[@]} секретов для ветки '$branch_name' с ключевыми словами:${NC}" >&2
     for secret in "${filtered_secrets[@]}"; do
         echo -e "  ${GREEN}- $secret${NC}" >&2
     done
     
-    # Сортируем секреты по релевантности (сначала те, что содержат имя пода)
-    local sorted_secrets=()
-    for secret in "${filtered_secrets[@]}"; do
-        if [[ "$secret" == *"$base_pod_name"* ]]; then
-            # Секреты с именем пода добавляем в начало
-            sorted_secrets=("$secret" "${sorted_secrets[@]}")
-        else
-            # Остальные добавляем в конец
-            sorted_secrets+=("$secret")
-        fi
-    done
+    # Сортируем секреты для удобства выбора
+    local sorted_secrets=($(printf '%s\n' "${filtered_secrets[@]}" | sort))
     
     local secret_name
     if [ ${#sorted_secrets[@]} -eq 1 ]; then
         secret_name="${sorted_secrets[0]}"
         echo -e "${GREEN}Используется единственный подходящий секрет: $secret_name${NC}" >&2
     else
-        echo -e "${CYAN}Найдено ${#sorted_secrets[@]} подходящих секретов${NC}" >&2
+        echo -e "${CYAN}Найдено ${#sorted_secrets[@]} секретов для ветки '$branch_name'${NC}" >&2
         secret_name=$(select_secret "${sorted_secrets[@]}")
         echo -e "${GREEN}Выбран секрет: $secret_name${NC}" >&2
     fi
@@ -269,7 +258,8 @@ exec_sql_table() {
 # Функция для выполнения SQL запросов (для случаев когда нужен простой вывод)
 exec_sql() {
     local sql_query=$(echo "$1" | sed 's/"/\\"/g')
-    kubectl exec -it -n $NAMESPACE $POD_NAME -- bash -c "PGPASSWORD=\"$PG_PASSWORD\" psql -U postgres -Aqtc \"$sql_query\""
+    # Убираем флаг -t чтобы избежать проблем с TTY
+    kubectl exec -i -n $NAMESPACE $POD_NAME -- bash -c "PGPASSWORD=\"$PG_PASSWORD\" psql -U postgres -Aqtc \"$sql_query\" 2>/dev/null"
 }
 
 # 1. Проверка статуса Patroni через API
@@ -337,23 +327,43 @@ echo -e "${CYAN}Команда: du -smx /home/postgres/pgdata/pgroot/data${NC}"
 exec_in_pod du -smxh /home/postgres/pgdata/pgroot/data 2>/dev/null || echo -e "${RED}Ошибка при проверке размера data directory${NC}"
 
 # 8. Проверка активности WAL
-exec_sql_table "SELECT 
-    pg_last_wal_receive_lsn() as last_receive_lsn,
-    pg_last_wal_replay_lsn() as last_replay_lsn,
-    pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()) as replay_lag_bytes,
-    pg_size_pretty(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())) as replay_lag_pretty,
-    pg_is_wal_replay_paused() as is_replay_paused;" "8. Активность WAL"
+echo -e "\n${PURPLE}${BOLD}8. Активность WAL:${NC}"
+# Проверяем, находится ли база в режиме восстановления (реплика)
+IS_RECOVERY=$(exec_sql "SELECT pg_is_in_recovery();")
+if [ "$IS_RECOVERY" = "t" ]; then
+    exec_sql_table "SELECT 
+        pg_last_wal_receive_lsn() as last_receive_lsn,
+        pg_last_wal_replay_lsn() as last_replay_lsn,
+        pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()) as replay_lag_bytes,
+        pg_size_pretty(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())) as replay_lag_pretty,
+        pg_is_wal_replay_paused() as is_replay_paused;" "8. Активность WAL (реплика)"
+else
+    exec_sql_table "SELECT 
+        pg_current_wal_lsn() as current_wal_lsn,
+        'N/A' as last_receive_lsn,
+        'N/A' as last_replay_lsn,
+        0 as replay_lag_bytes,
+        '0 bytes' as replay_lag_pretty,
+        false as is_replay_paused;" "8. Активность WAL (мастер)"
+fi
 
 # 9. Проверка статуса репликации из pg_stat_wal_receiver
-exec_sql_table "SELECT 
-    status, 
-    last_msg_send_time, 
-    last_msg_receipt_time,
-    latest_end_lsn, 
-    latest_end_time,
-    pg_wal_lsn_diff(pg_last_wal_replay_lsn(), latest_end_lsn) as lag_bytes,
-    pg_size_pretty(pg_wal_lsn_diff(pg_last_wal_replay_lsn(), latest_end_lsn)) as lag_pretty
-FROM pg_stat_wal_receiver;" "9. Статус получения WAL (для standby)"
+# Эта функция работает только на репликах, поэтому проверяем режим
+IS_RECOVERY=$(exec_sql "SELECT pg_is_in_recovery();")
+if [ "$IS_RECOVERY" = "t" ]; then
+    exec_sql_table "SELECT 
+        status, 
+        last_msg_send_time, 
+        last_msg_receipt_time,
+        latest_end_lsn, 
+        latest_end_time,
+        pg_wal_lsn_diff(pg_last_wal_replay_lsn(), latest_end_lsn) as lag_bytes,
+        pg_size_pretty(pg_wal_lsn_diff(pg_last_wal_replay_lsn(), latest_end_lsn)) as lag_pretty
+    FROM pg_stat_wal_receiver;" "9. Статус получения WAL (для standby)"
+else
+    echo -e "\n${PURPLE}${BOLD}9. Статус получения WAL:${NC}"
+    echo -e "${YELLOW}Не применимо для мастера - функция pg_stat_wal_receiver работает только на репликах${NC}"
+fi
 
 # 10. Проверка табличных пространств
 exec_sql_table "SELECT 
