@@ -7,6 +7,7 @@ set -e
 
 # Цвета для вывода
 RED='\033[0;31m'
+LIGHT_RED='\033[1;31m'  # Добавьте эту строку
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
@@ -64,7 +65,6 @@ select_secret() {
     done
 }
 
-# Функция для получения пароля из секрета
 # Функция для получения пароля из секрета
 get_password_from_secret() {
     local base_pod_name=$(get_base_pod_name "$POD_NAME")
@@ -163,12 +163,16 @@ get_password_from_secret() {
     return 1
 }
 
+# Функция для получения логов пода
+get_pod_logs() {
+    kubectl logs -n $NAMESPACE $POD_NAME --tail=100 2>/dev/null || echo -e "${RED}Не удалось получить логи пода${NC}"
+}
+
 # Функция для вывода логов с цветовым кодированием
 show_pod_logs() {
-    echo -e "\n${PURPLE}${BOLD}12. Логи пода (последние 5 сообщений каждого уровня):${NC}"
+    local all_logs="$1"
     
-    # Получаем все логи и фильтруем по уровням
-    local all_logs=$(kubectl logs -n $NAMESPACE $POD_NAME --tail=100 2>/dev/null || echo -e "${RED}Не удалось получить логи пода${NC}")
+    echo -e "\n${PURPLE}${BOLD}12. Логи пода (последние 5 сообщений каждого уровня):${NC}"
     
     # ERROR логи (красный)
     echo -e "\n${RED}${BOLD}ERROR логи:${NC}"
@@ -215,9 +219,73 @@ show_pod_logs() {
         echo -e "${GREEN}Нет FATAL сообщений${NC}"
     fi
     
-    # Общий обзор логов
+    # Общий обзор логов - ИСПРАВЛЕНО: корректно ограничиваем 10 строками
     echo -e "\n${YELLOW}${BOLD}Общий обзор логов (последние 10 строк):${NC}"
-    kubectl logs -n $NAMESPACE $POD_NAME --tail=10 2>/dev/null || echo -e "${RED}Не удалось получить логи пода${NC}"
+    echo "$all_logs" | tail -10
+}
+
+# Функция для проверки критических ошибок в логах
+check_critical_errors() {
+    local logs="$1"
+    local has_critical_errors=false
+    
+    # Паттерны критических ошибок
+    local critical_patterns=(
+        "Failed to bootstrap cluster"
+        "password authentication failed"
+        "no pg_hba.conf entry"
+        "FATAL:"
+        "patroni.exceptions.PatroniFatalException"
+        "connection to server.*failed"
+        "bootstrap failed"
+        "removing data directory"
+    )
+    
+    echo -e "\n${RED}${BOLD}ПРОВЕРКА КРИТИЧЕСКИХ ОШИБОК:${NC}"
+    
+    for pattern in "${critical_patterns[@]}"; do
+        # Используем grep только для строк с ошибками (без контекста)
+        local error_lines=$(echo "$logs" | grep -n -i "$pattern" 2>/dev/null || true)
+        
+        if [ -n "$error_lines" ]; then
+            echo -e "\n${RED}❌ Найдена критическая ошибка: $pattern${NC}"
+            echo -e "${YELLOW}Строки с ошибками:${NC}"
+            # Выводим только строки с ошибками светло-красным цветом
+            while IFS= read -r line; do
+                echo -e "${LIGHT_RED}$line${NC}"
+            done <<< "$error_lines"
+            has_critical_errors=true
+        fi
+    done
+    
+    if [ "$has_critical_errors" = true ]; then
+        echo -e "\n${RED}${BOLD}╔═══════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}${BOLD}║                 ОБНАРУЖЕНЫ КРИТИЧЕСКИЕ ОШИБКИ!                 ║${NC}"
+        echo -e "${RED}${BOLD}╚═══════════════════════════════════════════════════════════════╝${NC}"
+        
+        echo -e "\n${YELLOW}${BOLD}Возможные причины и решения:${NC}"
+        echo -e "${YELLOW}1. Проблемы аутентификации:${NC}"
+        echo -e "   • Проверьте пароль пользователя 'standby' в секретах"
+        echo -e "   • Убедитесь, что в pg_hba.conf разрешены подключения с данного хоста"
+        echo -e "   • Проверьте правильность настроек репликации"
+        
+        echo -e "\n${YELLOW}2. Проблемы сети:${NC}"
+        echo -e "   • Проверьте доступность мастера PostgreSQL (172.16.0.212:30122)"
+        echo -e "   • Убедитесь, что нет блокировки сетевых подключений"
+        
+        echo -e "\n${YELLOW}3. Проблемы конфигурации Patroni:${NC}"
+        echo -e "   • Проверьте настройки bootstrap в конфигурации Patroni"
+        echo -e "   • Убедитесь в правильности параметров standby_cluster"
+        
+        echo -e "\n${YELLOW}4. Проблемы с данными:${NC}"
+        echo -e "   • Проверьте, что data directory чиста перед инициализацией"
+        echo -e "   • Убедитесь в достаточности места на диске"
+        
+        return 1
+    else
+        echo -e "${GREEN}✅ Критических ошибок не обнаружено${NC}"
+        return 0
+    fi
 }
 
 # Если пароль не передан как аргумент, получаем его из секрета
@@ -283,7 +351,20 @@ fi
 echo -e "\n${GREEN}${BOLD}2. Статус через patronictl:${NC}"
 exec_in_pod patronictl list 2>/dev/null || echo -e "${RED}Ошибка при выполнении patronictl list${NC}"
 
-# 3. Проверка репликации в PostgreSQL
+# Получаем логи один раз и используем для всех проверок
+echo -e "\n${GREEN}${BOLD}3. Анализ логов пода:${NC}"
+POD_LOGS=$(get_pod_logs)
+
+# Проверка критических ошибок
+if ! check_critical_errors "$POD_LOGS"; then
+    echo -e "\n${RED}${BOLD}Скрипт остановлен из-за критических ошибок!${NC}"
+    echo -e "${YELLOW}Необходимо устранить указанные проблемы перед продолжением работы.${NC}"
+    exit 1
+fi
+
+# Дальнейшие проверки выполняются только если нет критических ошибок
+
+# 4. Проверка репликации в PostgreSQL
 exec_sql_table "SELECT 
     client_addr, 
     usename,
@@ -293,16 +374,16 @@ exec_sql_table "SELECT
     pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) as replay_lag_bytes,
     pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)) as replay_lag_pretty,
     ROUND(EXTRACT(EPOCH FROM (now() - reply_time))::numeric, 2) as replay_lag_seconds
-FROM pg_stat_replication;" "3. Статус репликации"
+FROM pg_stat_replication;" "4. Статус репликации"
 
-# 4. Проверка лага репликации
+# 5. Проверка лага репликации
 exec_sql_table "SELECT 
     application_name,
     pg_wal_lsn_diff(sent_lsn, replay_lsn) as replication_lag_bytes,
     pg_size_pretty(pg_wal_lsn_diff(sent_lsn, replay_lsn)) as replication_lag_pretty
-FROM pg_stat_replication;" "4. Лаг репликации"
+FROM pg_stat_replication;" "5. Лаг репликации"
 
-# 5. Проверка слотов репликации
+# 6. Проверка слотов репликации
 exec_sql_table "SELECT 
     slot_name, 
     plugin, 
@@ -311,23 +392,23 @@ exec_sql_table "SELECT
     active, 
     pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) as restart_lag,
     pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) as confirmed_lag
-FROM pg_replication_slots;" "5. Слоты репликации"
+FROM pg_replication_slots;" "6. Слоты репликации"
 
-# 6. Размер базы данных
+# 7. Размер базы данных
 exec_sql_table "SELECT 
     datname, 
     pg_size_pretty(pg_database_size(datname)) as size 
 FROM pg_database 
 WHERE datistemplate = false 
-ORDER BY pg_database_size(datname) DESC;" "6. Размер базы данных"
+ORDER BY pg_database_size(datname) DESC;" "7. Размер базы данных"
 
-# 7. Общий размер data directory
-echo -e "\n${PURPLE}${BOLD}7. Размер data directory (реальный):${NC}"
+# 8. Общий размер data directory
+echo -e "\n${PURPLE}${BOLD}8. Размер data directory (реальный):${NC}"
 echo -e "${CYAN}Команда: du -smx /home/postgres/pgdata/pgroot/data${NC}"
 exec_in_pod du -smxh /home/postgres/pgdata/pgroot/data 2>/dev/null || echo -e "${RED}Ошибка при проверке размера data directory${NC}"
 
-# 8. Проверка активности WAL
-echo -e "\n${PURPLE}${BOLD}8. Активность WAL:${NC}"
+# 9. Проверка активности WAL
+echo -e "\n${PURPLE}${BOLD}9. Активность WAL:${NC}"
 # Проверяем, находится ли база в режиме восстановления (реплика)
 IS_RECOVERY=$(exec_sql "SELECT pg_is_in_recovery();")
 if [ "$IS_RECOVERY" = "t" ]; then
@@ -336,7 +417,7 @@ if [ "$IS_RECOVERY" = "t" ]; then
         pg_last_wal_replay_lsn() as last_replay_lsn,
         pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()) as replay_lag_bytes,
         pg_size_pretty(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())) as replay_lag_pretty,
-        pg_is_wal_replay_paused() as is_replay_paused;" "8. Активность WAL (реплика)"
+        pg_is_wal_replay_paused() as is_replay_paused;" "9. Активность WAL (реплика)"
 else
     exec_sql_table "SELECT 
         pg_current_wal_lsn() as current_wal_lsn,
@@ -344,10 +425,10 @@ else
         'N/A' as last_replay_lsn,
         0 as replay_lag_bytes,
         '0 bytes' as replay_lag_pretty,
-        false as is_replay_paused;" "8. Активность WAL (мастер)"
+        false as is_replay_paused;" "9. Активность WAL (мастер)"
 fi
 
-# 9. Проверка статуса репликации из pg_stat_wal_receiver
+# 10. Проверка статуса репликации из pg_stat_wal_receiver
 # Эта функция работает только на репликах, поэтому проверяем режим
 IS_RECOVERY=$(exec_sql "SELECT pg_is_in_recovery();")
 if [ "$IS_RECOVERY" = "t" ]; then
@@ -359,33 +440,22 @@ if [ "$IS_RECOVERY" = "t" ]; then
         latest_end_time,
         pg_wal_lsn_diff(pg_last_wal_replay_lsn(), latest_end_lsn) as lag_bytes,
         pg_size_pretty(pg_wal_lsn_diff(pg_last_wal_replay_lsn(), latest_end_lsn)) as lag_pretty
-    FROM pg_stat_wal_receiver;" "9. Статус получения WAL (для standby)"
+    FROM pg_stat_wal_receiver;" "10. Статус получения WAL (для standby)"
 else
-    echo -e "\n${PURPLE}${BOLD}9. Статус получения WAL:${NC}"
+    echo -e "\n${PURPLE}${BOLD}10. Статус получения WAL:${NC}"
     echo -e "${YELLOW}Не применимо для мастера - функция pg_stat_wal_receiver работает только на репликах${NC}"
 fi
 
-# 10. Проверка табличных пространств
+# 11. Проверка табличных пространств
 exec_sql_table "SELECT 
     spcname, 
     pg_tablespace_location(oid) as location,
     pg_size_pretty(pg_tablespace_size(oid)) as size 
 FROM pg_tablespace 
-WHERE spcname != 'pg_default';" "10. Табличные пространства"
+WHERE spcname != 'pg_default';" "11. Табличные пространства"
 
-# 11. Проверка подключений
-exec_sql_table "SELECT 
-    datname, 
-    usename, 
-    state, 
-    count(*) 
-FROM pg_stat_activity 
-WHERE state IS NOT NULL 
-GROUP BY datname, usename, state 
-ORDER BY count DESC;" "11. Активные подключения"
-
-# 12. Вывод логов пода
-show_pod_logs
+# 12. Вывод логов пода (как было изначально)
+show_pod_logs "$POD_LOGS"
 
 echo -e "\n${BLUE}${BOLD}==============================================${NC}"
 echo -e "${GREEN}${BOLD}Проверка завершена${NC}"
