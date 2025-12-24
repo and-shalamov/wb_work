@@ -376,6 +376,19 @@ exec_sql_table "SELECT
     ROUND(EXTRACT(EPOCH FROM (now() - reply_time))::numeric, 2) as replay_lag_seconds
 FROM pg_stat_replication;" "4. Статус репликации"
 
+# 4.1. На мастер-ноде проверьте синхронные реплики
+exec_sql_table "SELECT application_name, 
+       client_addr,
+       state,
+       sync_state,
+       sync_priority
+FROM pg_stat_replication;" "4.1. На мастер-ноде проверьте синхронные реплики"
+
+# 4.2. Проверьте параметры синхронной репликации
+exec_sql_table "SELECT name, setting, unit 
+FROM pg_settings 
+WHERE name IN ('synchronous_commit', 'synchronous_standby_names');" "4.2. Проверьте параметры синхронной репликации"
+
 # 5. Проверка лага репликации
 exec_sql_table "SELECT 
     application_name,
